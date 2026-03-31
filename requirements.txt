@@ -1,0 +1,9 @@
+# Flask RSS Cleaning Proxy — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+flask>=3.0,<4
+requests>=2.31,<3
+feedparser>=6.0,<7
+beautifulsoup4>=4.12,<5
+lxml>=5.0,<6              # fast HTML parser for BeautifulSoup
+gunicorn>=21.0,<23        # WSGI server for production
