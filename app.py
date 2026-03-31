@@ -46,16 +46,23 @@ FETCH_TIMEOUT = 10       # seconds for upstream HTTP requests
 # ── URL Whitelist ─────────────────────────────────────────────────────────────
 # Add exact feed URLs you want to allow here.
 ALLOWED_FEED_URLS: set[str] = {
-    "https://feeds.bbcnews.com/news/rss.xml",
+    "https://nitter.net/elonmusk/rss",
+    "https://nitter.net/sama/rss",
+    "https://nitter.privacydev.net/elonmusk/rss",
+    "https://nitter.privacydev.net/sama/rss",
     # Add more as needed…
 }
 
 # Any feed URL whose hostname is in this set is also allowed.
-
+# This lets you whitelist an entire Nitter instance instead of per-account.
 ALLOWED_DOMAINS: set[str] = {
-    "feeds.bbcnews.com",
-    "rss.cnn.com",
-    "feeds.reuters.com",
+    "nitter.net",
+    "nitter.privacydev.net",
+    "nitter.cz",
+    "nitter.1d4.us",
+    "nitter.kavin.rocks",
+    "nitter.unixfox.eu",
+    "nitter.42l.fr",
 }
 
 # Image src patterns that identify avatars / icons — skip these
