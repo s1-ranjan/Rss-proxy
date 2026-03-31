@@ -50,6 +50,7 @@ ALLOWED_FEED_URLS: set[str] = {
     "https://nitter.net/sama/rss",
     "https://nitter.privacydev.net/elonmusk/rss",
     "https://nitter.privacydev.net/sama/rss",
+    "https://nitter.net/IPRDBihar/rss",
     # Add more as needed…
 }
 
