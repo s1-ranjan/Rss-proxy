@@ -38,7 +38,7 @@ log = logging.getLogger(__name__)
 # Configuration  (edit these to suit your deployment)
 # ─────────────────────────────────────────────────────────────────────────────
 
-MAX_ITEMS    = 10        # items returned per feed
+MAX_ITEMS    = 39        # items returned per feed
 CACHE_TTL    = 300       # seconds (5 minutes)
 MAX_TEXT_LEN = 9999       # characters for cleaned description
 FETCH_TIMEOUT = 10       # seconds for upstream HTTP requests
@@ -165,9 +165,9 @@ def fetch_feed(url: str) -> feedparser.FeedParserDict | None:
 def clean_text(raw: str) -> str:
     """
     Strip RT prefixes, mentions, hashtags, and URLs.
-    Normalise whitespace. Truncate to MAX_TEXT_LEN characters.
+    Preserves paragraph breaks. Truncates to MAX_TEXT_LEN characters.
     """
-    # 1. Remove  "RT by @user:" prefixes
+    # 1. Remove "RT by @user:" prefixes
     text = re.sub(r"^RT\s+by\s+@\w+:\s*", "", raw.strip(), flags=re.IGNORECASE)
 
     # 2. Remove bare URLs
@@ -179,10 +179,25 @@ def clean_text(raw: str) -> str:
     # 4. Remove #hashtags
     text = re.sub(r"#\w+", "", text)
 
-    # 5. Collapse whitespace
-    text = re.sub(r"\s+", " ", text).strip()
+    # 5. Normalize spaces within each line but preserve line breaks
+    lines = text.split("\n")
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in lines]
 
-    # 6. Soft-truncate at a word boundary
+    # 6. Collapse 3+ consecutive blank lines down to max one blank line
+    cleaned_lines = []
+    blank_count = 0
+    for line in lines:
+        if line == "":
+            blank_count += 1
+            if blank_count <= 1:
+                cleaned_lines.append("")
+        else:
+            blank_count = 0
+            cleaned_lines.append(line)
+
+    text = "\n".join(cleaned_lines).strip()
+
+    # 7. Soft-truncate at a word boundary
     if len(text) > MAX_TEXT_LEN:
         text = text[:MAX_TEXT_LEN].rsplit(" ", 1)[0] + "…"
 
@@ -194,10 +209,18 @@ def clean_text(raw: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def html_to_text(html: str) -> str:
-    """Plain-text extraction via BeautifulSoup."""
+    """
+    Plain-text extraction via BeautifulSoup.
+    Inserts newlines at block-level elements to preserve paragraph structure.
+    """
     if not html:
         return ""
-    return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
+    soup = BeautifulSoup(html, "html.parser")
+    # Insert newlines around block-level tags before extracting text
+    for tag in soup.find_all(["p", "br", "div", "li", "blockquote"]):
+        tag.insert_before("\n")
+        tag.insert_after("\n")
+    return soup.get_text(separator="", strip=False).strip()
 
 
 def extract_images(html: str, base_url: str = "") -> list[str]:
@@ -322,10 +345,9 @@ def build_rss(feed_title: str, feed_link: str, feed_desc: str, items: list[dict]
 
     for item in items:
         images = item["images"]
-        total  = len(images)
 
-        # Description body: clean text + image link list
-        desc_parts = [item["text"]]
+        # Description body: clean text only (images go in enclosures)
+        cdata_body = item["text"]
 
         # One <enclosure> per image
         enc_lines = "\n    ".join(
