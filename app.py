@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 
 MAX_ITEMS    = 10        # items returned per feed
 CACHE_TTL    = 300       # seconds (5 minutes)
-MAX_TEXT_LEN = 400       # characters for cleaned description
+MAX_TEXT_LEN = 9999       # characters for cleaned description
 FETCH_TIMEOUT = 10       # seconds for upstream HTTP requests
 
 # ── URL Whitelist ─────────────────────────────────────────────────────────────
