@@ -326,11 +326,6 @@ def build_rss(feed_title: str, feed_link: str, feed_desc: str, items: list[dict]
 
         # Description body: clean text + image link list
         desc_parts = [item["text"]]
-        if images:
-            desc_parts.append("")
-            for idx, img_url in enumerate(images, 1):
-                desc_parts.append(f"🖼 [{idx}/{total}] {img_url}")
-        cdata_body = "\n".join(desc_parts)
 
         # One <enclosure> per image
         enc_lines = "\n    ".join(
