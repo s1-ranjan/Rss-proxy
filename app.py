@@ -9,7 +9,7 @@ Endpoints:
   GET /                              → usage info
 
 Deploy with:
-  gunicorn -w 2 -b 0.0.0.0:8000 app:app
+  gunicorn -c gunicorn.conf.py app:app
 """
 
 import re
@@ -35,45 +35,44 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration  (edit these to suit your deployment)
+# Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-MAX_ITEMS    = 39        # items returned per feed
-CACHE_TTL    = 300       # seconds (5 minutes)
-MAX_TEXT_LEN = 9999       # characters for cleaned description
+MAX_ITEMS     = 20       # items returned per feed
+CACHE_TTL     = 300      # seconds (5 minutes)
+MAX_TEXT_LEN  = 9999     # characters — increased to fit quoted tweets cleanly
 FETCH_TIMEOUT = 10       # seconds for upstream HTTP requests
 
 # ── URL Whitelist ─────────────────────────────────────────────────────────────
-# Add exact feed URLs you want to allow here.
+# Add exact feed URLs OR just add the domain to ALLOWED_DOMAINS below.
 ALLOWED_FEED_URLS: set[str] = {
-    "https://nitter.net/elonmusk/rss",
-    "https://nitter.net/sama/rss",
-    "https://nitter.privacydev.net/elonmusk/rss",
-    "https://nitter.privacydev.net/sama/rss",
     "https://nitter.net/IPRDBihar/rss",
-    # Add more as needed…
+    # Add specific feed URLs here if needed
 }
 
-# Any feed URL whose hostname is in this set is also allowed.
-# This lets you whitelist an entire Nitter instance instead of per-account.
+# Any feed URL whose hostname matches is allowed.
 ALLOWED_DOMAINS: set[str] = {
     "nitter.net",
     "nitter.privacydev.net",
+    "nitter.poast.org",
+    "xcancel.com",
     "nitter.cz",
     "nitter.1d4.us",
     "nitter.kavin.rocks",
     "nitter.unixfox.eu",
     "nitter.42l.fr",
+    "twitt.re",
+    "nitter.pek.li",
 }
 
-# Image src patterns that identify avatars / icons — skip these
+# Image patterns that identify avatars / icons — skip these
 IGNORED_IMAGE_RE = re.compile(
     r"(avatar|profile_images|icon|logo|emoji|favicon|badge|default_profile)",
     re.IGNORECASE,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Simple in-memory cache   { key: (timestamp, payload) }
+# In-memory cache   { key: (timestamp, payload) }
 # ─────────────────────────────────────────────────────────────────────────────
 _cache: dict[str, tuple[float, str]] = {}
 
@@ -82,7 +81,7 @@ def cache_get(key: str) -> str | None:
     entry = _cache.get(key)
     if entry and (time.time() - entry[0]) < CACHE_TTL:
         return entry[1]
-    _cache.pop(key, None)          # evict stale entry
+    _cache.pop(key, None)
     return None
 
 
@@ -98,14 +97,13 @@ _PRIVATE_PREFIXES = ("localhost", "127.", "10.", "192.168.", "172.", "0.0.0.0")
 
 def is_url_allowed(url: str) -> bool:
     """
-    Return True only if the URL passes all security checks:
-    1. Valid http/https scheme
-    2. Not pointing at a private/loopback address (SSRF prevention)
-    3. Matches the exact whitelist OR a whitelisted domain
+    SSRF-safe URL check:
+    1. Must be http/https
+    2. Must not point to private/loopback addresses
+    3. Must match exact whitelist OR whitelisted domain
     """
     if not url:
         return False
-
     try:
         parsed = urlparse(url)
     except Exception:
@@ -115,15 +113,11 @@ def is_url_allowed(url: str) -> bool:
         return False
 
     host = (parsed.hostname or "").lower()
-
     if not host or any(host.startswith(p) for p in _PRIVATE_PREFIXES):
         return False
 
-    # Exact URL match
     if url in ALLOWED_FEED_URLS:
         return True
-
-    # Domain match  (allows any path on that Nitter instance)
     if host in ALLOWED_DOMAINS:
         return True
 
@@ -135,10 +129,7 @@ def is_url_allowed(url: str) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_feed(url: str) -> feedparser.FeedParserDict | None:
-    """
-    Fetch RSS via requests (so we control timeout & headers),
-    then parse with feedparser. Returns None on any error.
-    """
+    """Fetch and parse an RSS feed. Returns None on any error."""
     try:
         resp = requests.get(
             url,
@@ -159,78 +150,211 @@ def fetch_feed(url: str) -> feedparser.FeedParserDict | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Content cleaning
+# HTML → Plain text  (BeautifulSoup only, no regex on HTML)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def html_to_text(html: str) -> str:
+    """
+    Convert Nitter HTML description to clean plain text.
+
+    Handles:
+    - <p> / <br> / <div>  → paragraph breaks
+    - <blockquote>         → quoted tweet block with 💬 author header
+    - <hr/>                → visual divider ────────────────
+    - <footer> / <cite>    → removed (raw citation URLs)
+    - <a> wrapping Video   → replaced with ▶ Video marker
+    - all other <a>        → unwrapped (text kept, href dropped)
+    - <img>                → removed from text (handled separately)
+    """
+    if not html:
+        return ""
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. Remove <footer> and <cite> — Nitter puts raw citation URLs here
+    for tag in soup.find_all(["footer", "cite"]):
+        tag.decompose()
+
+    # 2. Remove all <img> tags from text — images are extracted separately
+    for img in soup.find_all("img"):
+        img.decompose()
+
+    # 3. Handle <a> tags:
+    #    - Video anchors → ▶ Video marker
+    #    - All others    → unwrap (keep text, discard href)
+    for a_tag in soup.find_all("a", href=True):
+        link_text = a_tag.get_text(strip=True)
+        if "video" in link_text.lower():
+            a_tag.replace_with("\n▶ Video\n")
+        else:
+            a_tag.unwrap()
+
+    # 4. Replace <hr/> with a visual divider line
+    for hr in soup.find_all("hr"):
+        hr.replace_with("\n" + "─" * 16 + "\n")
+
+    # 5. Format <blockquote> as a clean quoted section.
+    #    Author name is extracted HERE before clean_text can strip @mentions.
+    for bq in soup.find_all("blockquote"):
+        # Extract author name from <b> tag (e.g. "Nitish Kumar (@NitishKumar)")
+        author_tag = bq.find("b")
+        if author_tag:
+            author_name = author_tag.get_text(strip=True)
+            author_tag.decompose()
+        else:
+            author_name = ""
+
+        # Insert newlines at block-level tags inside the blockquote
+        for inner in bq.find_all(["p", "br", "div"]):
+            inner.insert_before("\n")
+            inner.insert_after("\n")
+
+        bq_text = bq.get_text(separator="", strip=False)
+        bq_text = re.sub(r"\n{3,}", "\n\n", bq_text).strip()
+
+        if author_name:
+            quoted_block = f"\n\n💬 {author_name}\n{bq_text}\n"
+        else:
+            quoted_block = f"\n\n💬\n{bq_text}\n" if bq_text else ""
+
+        bq.replace_with(quoted_block)
+
+    # 6. Insert newlines at remaining block-level elements
+    for tag in soup.find_all(["p", "br", "div", "li"]):
+        tag.insert_before("\n")
+        tag.insert_after("\n")
+
+    text = soup.get_text(separator="", strip=False)
+
+    # Collapse 3+ newlines → max 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Text cleaning  (runs on plain text AFTER html_to_text)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Lines starting with 💬 are author attribution — never strip @handles from them
+_AUTHOR_LINE_RE = re.compile(r"^💬")
+# Lines that are pure dividers — never touch
+_DIVIDER_LINE_RE = re.compile(r"^─+$")
+
+
+def _clean_line(line: str) -> str:
+    """
+    Clean a single plain-text line:
+    - Skip author lines (💬 ...) — preserve @handles in them
+    - Skip divider lines (────)
+    - Skip video markers (▶ Video)
+    - Otherwise: remove URLs, @mentions, #hashtags, normalise spaces
+    """
+    if _AUTHOR_LINE_RE.match(line):
+        return line
+    if _DIVIDER_LINE_RE.match(line):
+        return line
+    if line.strip() == "▶ Video":
+        return line
+
+    line = re.sub(r"https?://\S+", "", line)   # remove URLs
+    line = re.sub(r"@\w+", "", line)            # remove @mentions
+    line = re.sub(r"#\w+", "", line)            # remove #hashtags
+    line = re.sub(r"[ \t]+", " ", line).strip() # normalise spaces
+    return line
+
 
 def clean_text(raw: str) -> str:
     """
-    Strip RT prefixes, mentions, hashtags, and URLs.
-    Preserves paragraph breaks. Truncates to MAX_TEXT_LEN characters.
+    Full description cleaner:
+    - Removes RT/R-to/Reply prefixes (both Nitter styles)
+    - Cleans line by line (preserving author/divider/video lines)
+    - Removes orphan blank lines left after stripping mentions
+    - Collapses excessive blank lines (max 1 between paragraphs)
+    - Soft-truncates to MAX_TEXT_LEN at a word boundary
     """
-    # 1. Remove "RT by @user:" prefixes
-    text = re.sub(r"^RT\s+by\s+@\w+:\s*", "", raw.strip(), flags=re.IGNORECASE)
+    if not raw:
+        return ""
 
-    # 2. Remove bare URLs
-    text = re.sub(r"https?://\S+", "", text)
+    # FIX 1: Handle BOTH Nitter RT/reply prefix styles:
+    #   "RT by @IPRDBihar: …"  (retweet)
+    #   "R to @IPRDBihar: …"   (reply — Nitter's actual label)
+    text = re.sub(
+        r"^R(?:T\s+by|(?:\s+to))\s+@\w+:\s*",
+        "",
+        raw.strip(),
+        flags=re.IGNORECASE,
+    )
 
-    # 3. Remove @mentions
-    text = re.sub(r"@\w+", "", text)
+    # Clean line by line
+    lines   = text.split("\n")
+    cleaned = [_clean_line(line) for line in lines]
 
-    # 4. Remove #hashtags
-    text = re.sub(r"#\w+", "", text)
-
-    # 5. Normalize spaces within each line but preserve line breaks
-    lines = text.split("\n")
-    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in lines]
-
-    # 6. Collapse 3+ consecutive blank lines down to max one blank line
-    cleaned_lines = []
+    # FIX 2: Remove lines that became empty ONLY because they were a lone
+    # @mention (e.g. "@NitishKumar" on its own line → stripped to "").
+    # We collapse all consecutive blank lines to max 1.
+    result_lines: list[str] = []
     blank_count = 0
-    for line in lines:
+    for line in cleaned:
         if line == "":
             blank_count += 1
             if blank_count <= 1:
-                cleaned_lines.append("")
+                result_lines.append("")
         else:
             blank_count = 0
-            cleaned_lines.append(line)
+            result_lines.append(line)
 
-    text = "\n".join(cleaned_lines).strip()
+    text = "\n".join(result_lines).strip()
 
-    # 7. Soft-truncate at a word boundary
+    # Soft-truncate at word boundary
     if len(text) > MAX_TEXT_LEN:
         text = text[:MAX_TEXT_LEN].rsplit(" ", 1)[0] + "…"
 
     return text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HTML / Media extraction  (BeautifulSoup only — no regex on HTML)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def html_to_text(html: str) -> str:
+def clean_title(raw: str) -> str:
     """
-    Plain-text extraction via BeautifulSoup.
-    Inserts newlines at block-level elements to preserve paragraph structure.
+    Clean a tweet title (single-line — strips everything, no paragraph logic).
+    Handles both 'RT by @user:' and 'R to @user:' prefixes.
+    Truncates to 200 chars.
     """
-    if not html:
+    if not raw:
         return ""
-    soup = BeautifulSoup(html, "html.parser")
-    # Insert newlines around block-level tags before extracting text
-    for tag in soup.find_all(["p", "br", "div", "li", "blockquote"]):
-        tag.insert_before("\n")
-        tag.insert_after("\n")
-    return soup.get_text(separator="", strip=False).strip()
 
+    # FIX 3: Nitter titles can be multiline — collapse to single line first
+    text = " ".join(raw.split())
+
+    # Remove RT/reply prefixes
+    text = re.sub(
+        r"^R(?:T\s+by|(?:\s+to))\s+@\w+:\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"@\w+", "", text)
+    text = re.sub(r"#\w+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if len(text) > 200:
+        text = text[:200].rsplit(" ", 1)[0] + "…"
+
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Image / media extraction
+# ─────────────────────────────────────────────────────────────────────────────
 
 def extract_images(html: str, base_url: str = "") -> list[str]:
     """
     Extract ordered, deduplicated image URLs from HTML.
-
-    - Checks both ``src`` and ``data-src`` (lazy-loaded images).
-    - Resolves relative paths to absolute URLs.
-    - Skips avatar / icon images matched by IGNORED_IMAGE_RE.
-    - Preserves carousel/thread order.
+    - Prefers data-src over src (lazy-loaded images)
+    - Resolves relative and protocol-relative URLs to absolute
+    - Skips avatars / icons matched by IGNORED_IMAGE_RE
+    - Preserves carousel order
     """
     if not html:
         return []
@@ -241,22 +365,16 @@ def extract_images(html: str, base_url: str = "") -> list[str]:
 
     for img in soup.find_all("img"):
         src = (img.get("data-src") or img.get("src") or "").strip()
-
         if not src:
             continue
-
-        # Resolve protocol-relative URLs
         if src.startswith("//"):
             src = "https:" + src
         elif not src.startswith("http") and base_url:
             src = urljoin(base_url, src)
-
         if not src.startswith("http"):
             continue
-
         if IGNORED_IMAGE_RE.search(src):
             continue
-
         if src not in seen:
             seen.add(src)
             images.append(src)
@@ -271,42 +389,42 @@ def extract_images(html: str, base_url: str = "") -> list[str]:
 def process_entry(entry: feedparser.FeedParserDict, feed_url: str) -> dict:
     """
     Extract and clean all fields from a feedparser entry.
-    Returns a normalised dict for RSS output.
+    Returns a normalised dict ready for RSS output.
     """
-    # ── Raw HTML content ───────────────────────────────────────────────────
+    # Raw HTML content — feedparser stores it in content[] or summary
     raw_html = ""
     if getattr(entry, "content", None):
         raw_html = entry.content[0].get("value", "")
     if not raw_html:
         raw_html = getattr(entry, "summary", "")
 
-    # ── Text ───────────────────────────────────────────────────────────────
+    # Description: HTML → plain text → clean
     clean = clean_text(html_to_text(raw_html))
 
-    # ── Images ────────────────────────────────────────────────────────────
-    # Parse the base origin so relative paths can be resolved
-    parsed = urlparse(feed_url)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    # Images from HTML body
+    parsed_url = urlparse(feed_url)
+    base_url   = f"{parsed_url.scheme}://{parsed_url.netloc}"
     images: list[str] = extract_images(raw_html, base_url=base_url)
 
-    # Also pull media_content and enclosures from feedparser itself
+    # FIX 4: Also pull images from feedparser media_content / enclosures
+    # (some Nitter instances put images here instead of in HTML)
     seen = set(images)
     for mc in getattr(entry, "media_content", []):
         url = mc.get("url", "").strip()
         if url and url not in seen and not IGNORED_IMAGE_RE.search(url):
             seen.add(url)
             images.append(url)
-
     for enc in getattr(entry, "enclosures", []):
         url = enc.get("url", "").strip()
         if url and url not in seen and not IGNORED_IMAGE_RE.search(url):
             seen.add(url)
             images.append(url)
 
-    # ── Metadata ───────────────────────────────────────────────────────────
-    title = clean_text(getattr(entry, "title", "") or "")
-    link  = getattr(entry, "link", "") or ""
-    guid  = getattr(entry, "id", link) or link   # must remain stable
+    # Title — use dedicated single-line cleaner
+    title = clean_title(getattr(entry, "title", "") or "")
+
+    link     = getattr(entry, "link", "") or ""
+    guid     = getattr(entry, "id", link) or link   # must stay stable
 
     pub_date = ""
     pp = getattr(entry, "published_parsed", None)
@@ -336,24 +454,24 @@ def _xe(s: str) -> str:
 def build_rss(feed_title: str, feed_link: str, feed_desc: str, items: list[dict]) -> str:
     """
     Produce a valid RSS 2.0 document.
-
-    - Descriptions wrapped in CDATA
-    - One <enclosure> per image (Telegram reads the first one)
-    - Fallback  🖼 [N/T] URL  lines in the description body
+    - Description in CDATA (clean text only, no image URLs)
+    - One <enclosure> per image for Telegram media display
     """
     item_blocks: list[str] = []
 
     for item in items:
         images = item["images"]
 
-        # Description body: clean text only (images go in enclosures)
-        cdata_body = item["text"]
-
-        # One <enclosure> per image
-        enc_lines = "\n    ".join(
-            f'<enclosure url="{_xe(img)}" type="image/jpeg" length="0"/>'
-            for img in images
-        )
+        # FIX 5: Only generate enclosure block when there are images.
+        # Previously an empty enc_lines string left a trailing blank line
+        # inside <item> which some RSS parsers flag as malformed.
+        if images:
+            enc_block = "\n    " + "\n    ".join(
+                f'<enclosure url="{_xe(img)}" type="image/jpeg" length="0"/>'
+                for img in images
+            )
+        else:
+            enc_block = ""
 
         item_blocks.append(
             f"""  <item>
@@ -361,12 +479,11 @@ def build_rss(feed_title: str, feed_link: str, feed_desc: str, items: list[dict]
     <link>{_xe(item['link'])}</link>
     <guid isPermaLink="false">{_xe(item['guid'])}</guid>
     <pubDate>{item['pub_date']}</pubDate>
-    <description><![CDATA[{cdata_body}]]></description>
-    {enc_lines}
+    <description><![CDATA[{item['text']}]]></description>{enc_block}
   </item>"""
         )
 
-    now = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+    now      = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
     items_xml = "\n".join(item_blocks)
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -391,7 +508,6 @@ app = Flask(__name__)
 def clean_feed():
     """
     GET /clean?url=<whitelisted_rss_url>
-
     Returns a cleaned, Telegram-friendly RSS 2.0 feed.
     Responses are cached for CACHE_TTL seconds.
     """
@@ -404,26 +520,23 @@ def clean_feed():
         log.warning("Blocked request for URL: %s", url)
         return jsonify(error="URL not in whitelist."), 403
 
-    # ── Cache hit ─────────────────────────────────────────────────────────
     cache_key = hashlib.md5(url.encode()).hexdigest()
     if cached := cache_get(cache_key):
         log.info("Cache HIT: %s", url)
         return Response(cached, mimetype="application/rss+xml")
 
-    # ── Fetch & parse ─────────────────────────────────────────────────────
     log.info("Fetching: %s", url)
     feed = fetch_feed(url)
     if feed is None:
         return jsonify(error="Failed to fetch or parse the feed."), 502
 
-    # ── Process + sort ────────────────────────────────────────────────────
     entries   = feed.entries[:MAX_ITEMS]
     processed = [process_entry(e, url) for e in entries]
     processed.sort(key=lambda x: x["pub_date"] or "", reverse=True)
 
     rss_out = build_rss(
-        feed_title=getattr(feed.feed, "title", "Cleaned Feed"),
-        feed_link =getattr(feed.feed, "link",  url),
+        feed_title=getattr(feed.feed, "title",       "Cleaned Feed"),
+        feed_link =getattr(feed.feed, "link",        url),
         feed_desc =getattr(feed.feed, "description", "Cleaned RSS feed"),
         items=processed,
     )
@@ -436,9 +549,7 @@ def clean_feed():
 def clean_all_feeds():
     """
     GET /clean-all?urls=url1,url2,…
-
-    Fetches multiple whitelisted feeds, merges all items,
-    sorts by pubDate (newest first), and deduplicates by guid.
+    Fetches multiple feeds, merges, sorts by pubDate, deduplicates by guid.
     """
     raw_urls = request.args.get("urls", "").strip()
     if not raw_urls:
@@ -452,21 +563,18 @@ def clean_all_feeds():
     if blocked:
         return jsonify(error="Some URLs are not in the whitelist.", blocked=blocked), 403
 
-    # ── Whole-response cache ──────────────────────────────────────────────
     combo_key = hashlib.md5("|".join(sorted(urls)).encode()).hexdigest()
     if cached := cache_get(combo_key):
         return Response(cached, mimetype="application/rss+xml")
 
-    # ── Merge feeds ───────────────────────────────────────────────────────
     all_items: list[dict] = []
-    seen_guids: set[str] = set()
+    seen_guids: set[str]  = set()
 
     for url in urls:
         feed = fetch_feed(url)
         if feed is None:
             log.warning("Skipping unreachable feed: %s", url)
             continue
-
         for entry in feed.entries[:MAX_ITEMS]:
             item = process_entry(entry, url)
             if item["guid"] in seen_guids:
@@ -489,7 +597,7 @@ def clean_all_feeds():
 
 @app.route("/health")
 def health():
-    """Health-check endpoint — useful for Render / UptimeRobot keep-alive."""
+    """Health-check — use for Render keep-alive / UptimeRobot."""
     return jsonify(status="ok", cached_feeds=len(_cache)), 200
 
 
@@ -508,7 +616,7 @@ def index():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WSGI entry-point
-#   Production:  gunicorn -w 2 -b 0.0.0.0:8000 app:app
+#   Production:  gunicorn -c gunicorn.conf.py app:app
 #   Development: python app.py
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
