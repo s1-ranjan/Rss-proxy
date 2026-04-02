@@ -159,9 +159,16 @@ def _is_mention_or_hashtag_link(tag) -> bool:
     return False
 
 def _node_is_only_whitespace_or_br(node) -> bool:
-    """True if a NavigableString is blank, or a <br> tag."""
+    """True if a NavigableString is blank/whitespace-only, a <br> tag,
+    or a pipe separator between mentions (e.g. ' | ')."""
     if isinstance(node, NavigableString):
-        return node.strip() == ""
+        stripped = node.strip()
+        if stripped == "":
+            return True
+        # Pipe separator between @mention links — treat as trailing whitespace
+        if re.match(r"^[|\s]+$", stripped):
+            return True
+        return False
     return getattr(node, "name", None) == "br"
 
 def _remove_trailing_tag_block_from_p(p_tag, mode: str) -> None:
@@ -320,6 +327,12 @@ def clean_html(html: str, base_url: str = "") -> str:
         if text.startswith("@"):
             full_name = (a.get("title") or "").strip()
             a.replace_with(full_name if full_name else text)
+            continue
+
+        # FIX 1: Inline hashtag search links → convert nitter search URL to x.com
+        # (trailing ones were handled by _process_p_tags; these are inline mid-sentence)
+        if text.startswith("#") and ("nitter" in href or href.startswith("/search")):
+            a["href"] = nitter_search_to_xcom(href)
             continue
 
         # Video / status anchor → convert href to x.com
@@ -500,8 +513,13 @@ def clean_title(raw: str) -> str:
         if not line:
             cut = i          # blank line — keep scanning up
             continue
+        # Pure tag line: only @mentions, #hashtags, > prefixes
         if re.match(r"^[@#>]", line) and re.match(r"^[>@#\w\s]+$", line):
             cut = i          # pure tag line — mark as trailing
+            continue
+        # Pipe-separated @mention line: "@a | @b | @c" — treat as trailing
+        if re.match(r"^@\w+", line) and re.match(r"^[@\w\s|>]+$", line):
+            cut = i
             continue
         break                # real content line — stop
 
