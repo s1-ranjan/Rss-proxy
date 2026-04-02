@@ -222,12 +222,9 @@ def _remove_trailing_tag_block_from_p(p_tag, mode: str) -> None:
                     # Restore it — don't extract
                     continue
                 elif is_mention:
-                    # Replace with full name text
-                    full_name = (node.get("title") or "").strip()
-                    if full_name:
-                        node.replace_with(full_name)
-                    else:
-                        node.unwrap()
+                    # Trailing @mentions: remove entirely in both modes.
+                    # (Inline mentions are handled separately in clean_html/html_to_text)
+                    node.extract()
             else:
                 # TEXT mode — remove both hashtags and mentions entirely
                 node.extract()
@@ -468,17 +465,65 @@ def clean_text(raw: str) -> str:
     return text
 
 def clean_title(raw: str) -> str:
+    """
+    Clean an RSS <title> field.
+
+    Strategy mirrors the description cleaning:
+    - Remove RT/R-to reply prefixes
+    - Remove trailing @mention and #hashtag lines (after a blank line)
+    - Keep INLINE @mentions / #hashtags that are part of the real sentence
+    - Strip remaining bare URLs
+    - Truncate to 200 chars
+    """
     if not raw:
         return ""
-    text = " ".join(raw.split())
+
+    # Remove RT/reply prefix
     text = re.sub(r"^R(?:T\s+by|(?:\s+to))\s+@\w+:\s*",
-                  "", text, flags=re.IGNORECASE)
-    text = re.sub(r"https?://\S+", "", text)
-    text = re.sub(r"@\w+", "", text)
-    text = re.sub(r"#\w+", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
+                  "", raw.strip(), flags=re.IGNORECASE)
+
+    # Split into lines and find where the trailing tag block starts.
+    # Nitter title format:
+    #   Line 1: real content (may start with #Hashtag or text)
+    #   Line 2: (blank)
+    #   Line 3+: @mention, @mention, #hashtag, #hashtag ...
+    # We want to keep lines up to (but not including) the trailing tag block.
+    lines = text.split("\n")
+
+    # Walk backwards: collect lines that are ONLY @mentions, #hashtags, or blank
+    _TRAILING_LINE_RE = re.compile(
+        r"^\s*(@\w+|#\w+|>?@\w+)?\s*$"
+    )
+    cut = len(lines)
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i].strip()
+        if not line:
+            cut = i          # blank line — keep scanning up
+            continue
+        if re.match(r"^[@#>]", line) and re.match(r"^[>@#\w\s]+$", line):
+            cut = i          # pure tag line — mark as trailing
+            continue
+        break                # real content line — stop
+
+    # Keep only up to the cut point
+    content_lines = lines[:cut]
+
+    # Strip bare URLs, normalise whitespace per line
+    cleaned = []
+    for line in content_lines:
+        line = re.sub(r"https?://\S+", "", line)
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        cleaned.append(line)
+
+    # Remove trailing blank lines
+    while cleaned and not cleaned[-1]:
+        cleaned.pop()
+
+    text = "\n".join(cleaned).strip()
+
     if len(text) > 200:
         text = text[:200].rsplit(" ", 1)[0] + "…"
+
     return text
 
 # ─────────────────────────────────────────────────────────────────────────────
