@@ -220,17 +220,12 @@ def _remove_trailing_tag_block_from_p(p_tag, mode: str) -> None:
 
             if mode == "html":
                 if is_hashtag:
-                    # Convert to x.com search link, keep as clickable link
-                    new_href = nitter_search_to_xcom(href)
-                    node["href"] = new_href
-                    # Keep the tag — don't remove it
-                    # But DO remove it from trailing_indices so it stays
-                    # We still want to trim the surrounding <br> separators though
-                    # Restore it — don't extract
-                    continue
+                    # Remove trailing hashtags entirely in HTML mode too.
+                    # The expected output shows no trailing hashtag links at all —
+                    # inline hashtags (mid-sentence) are converted to x.com separately.
+                    node.extract()
                 elif is_mention:
-                    # Trailing @mentions: remove entirely in both modes.
-                    # (Inline mentions are handled separately in clean_html/html_to_text)
+                    # Trailing @mentions: remove entirely
                     node.extract()
             else:
                 # TEXT mode — remove both hashtags and mentions entirely
@@ -539,8 +534,8 @@ def clean_title(raw: str) -> str:
 
     text = "\n".join(cleaned).strip()
 
-    if len(text) > 200:
-        text = text[:200].rsplit(" ", 1)[0] + "…"
+    if len(text) > 500:
+        text = text[:500].rsplit(" ", 1)[0] + "…"
 
     return text
 
