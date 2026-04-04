@@ -126,6 +126,31 @@ def nitter_search_to_xcom(href: str) -> str:
         return f"https://x.com{parsed.path}?{parsed.query}" if parsed.query else f"https://x.com{parsed.path}"
     return href
 
+def piped_to_youtube(href: str) -> str:
+    """Convert piped.video privacy-frontend URL to real YouTube URL.
+    https://piped.video/9VB5tTdFcg0?si=... → https://youtu.be/9VB5tTdFcg0?si=...
+    Also handles piped.kavin.rocks and similar instances.
+    """
+    if not href:
+        return href
+    parsed = urlparse(href)
+    host = (parsed.hostname or "").lower()
+    # Common piped.video instances
+    if "piped" in host or host in ("piped.video", "piped.kavin.rocks",
+                                    "piped.seonerd.de", "piped.aeong.one"):
+        # Path is the video ID e.g. /9VB5tTdFcg0
+        video_id = parsed.path.lstrip("/")
+        query    = f"?{parsed.query}" if parsed.query else ""
+        return f"https://youtu.be/{video_id}{query}"
+    return href
+
+def is_youtube_link(href: str) -> bool:
+    """True if this href points to YouTube or a piped.video frontend."""
+    if not href:
+        return False
+    host = (urlparse(href).hostname or "").lower()
+    return host in ("youtu.be", "www.youtube.com", "youtube.com") or "piped" in host
+
 def strip_username_from_author(author: str) -> str:
     """'Nitish Kumar (@NitishKumar)' → 'Nitish Kumar'"""
     author = re.sub(r"\s*\(@\w+\)\s*$", "", author).strip()
@@ -198,6 +223,12 @@ def _remove_trailing_tag_block_from_p(p_tag, mode: str) -> None:
         if node.name == "a":
             if _is_mention_or_hashtag_link(node):
                 trailing_indices.append(i)
+                continue
+            # YouTube/piped links are content (kept), but we continue scanning
+            # ABOVE them for trailing hashtags/mentions between them and the text.
+            href = node.get("href", "")
+            if is_youtube_link(href):
+                # Don't add to trailing (keep this link), but keep scanning upward
                 continue
         # Anything else — stop
         break
@@ -324,16 +355,31 @@ def clean_html(html: str, base_url: str = "") -> str:
             a.replace_with(full_name if full_name else text)
             continue
 
-        # FIX 1: Inline hashtag search links → convert nitter search URL to x.com
-        # (trailing ones were handled by _process_p_tags; these are inline mid-sentence)
+        # Inline hashtag search links → convert nitter search URL to x.com
         if text.startswith("#") and ("nitter" in href or href.startswith("/search")):
             a["href"] = nitter_search_to_xcom(href)
             continue
 
-        # Video / status anchor → convert href to x.com
+        # piped.video links → convert to real YouTube URL + set label text
+        if is_youtube_link(href):
+            real_href = piped_to_youtube(href)
+            a["href"] = real_href
+            # Replace link text with YouTube emoji label
+            for child in list(a.children):
+                child.extract()
+            a.append("▶️YouTube🔴")
+            continue
+
+        # Nitter video status anchor → convert href to x.com
+        #   AND replace the bare "Video" text node with "▶️ Video"
         converted = nitter_url_to_xcom(href)
         if converted != href:
             a["href"] = converted
+            # Replace any NavigableString "Video" inside this anchor
+            from bs4 import NavigableString as NS
+            for child in list(a.children):
+                if isinstance(child, NS) and child.strip().lower() == "video":
+                    child.replace_with("▶️ Video")
 
     # 7. Strip (@username) from blockquote author <b> tags
     for bq in soup.find_all("blockquote"):
@@ -516,15 +562,21 @@ def clean_title(raw: str) -> str:
         if re.match(r"^@\w+", line) and re.match(r"^[@\w\s|>]+$", line):
             cut = i
             continue
+        # Standalone URL-only line (e.g. https://youtu.be/...) — treat as trailing
+        if re.match(r"^https?://\S+$", line):
+            cut = i
+            continue
         break                # real content line — stop
 
     # Keep only up to the cut point
     content_lines = lines[:cut]
 
-    # Strip bare URLs, normalise whitespace per line
+    # Normalise whitespace per line.
+    # Do NOT strip URLs here — URLs like https://youtu.be/... that appear
+    # inline in the content line are meaningful and must be preserved.
+    # Only standalone URL-only lines were caught by the trailing block detector above.
     cleaned = []
     for line in content_lines:
-        line = re.sub(r"https?://\S+", "", line)
         line = re.sub(r"[ \t]+", " ", line).strip()
         cleaned.append(line)
 
