@@ -46,9 +46,16 @@ FETCH_TIMEOUT = 10
 ALLOWED_FEED_URLS: set[str] = {
     "https://nitter.net/elonmusk/rss",
     "https://nitter.net/sama/rss",
-    "https://nitter.privacydev.net/elonmusk/rss",
-    "https://nitter.privacydev.net/sama/rss",
+    "https://nitter.net/BiharRDD/rss",
+    "https://nitter.net/BiharRuralWorks/rss",
     "https://nitter.net/IPRDBihar/rss",
+    "https://nitter.net/seva_nbpdcl/rss",
+    "https://nitter.net/DeptCooperative/rss",
+    "https://nitter.net/agribih/rss",
+    "https://nitter.net/DirectorateOfF1/rss",
+    "https://nitter.net/BiharAFRD/rss",
+    "https://nitter.net/Rpcau_pusa/rss",
+    "https://nitter.net/kaankit/rss",
     # Add more as needed…
 }
 
